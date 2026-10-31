@@ -17,15 +17,17 @@
 ////////////////////////////////////////////////////////////////////////////////
 //
 // Parallelization (n <= 32):
-//  - one thread per element C(row, col) of a matrix: threadIdx.x = row, threadIdx.y = col;
+//  - threadIdx.y = column of C; threadIdx.x = a group of rows: each thread computes GEMM_R elements
+//    of its column (rows x, x + blockDim.x, x + 2*blockDim.x, ...), so one value of B loaded from
+//    shared memory is reused GEMM_R times from a register (register blocking);
 //  - several matrices per block when n is small (threadIdx.z = matrix inside the block), so that
 //    a block keeps about GEMM_THREADS threads busy even for tiny matrices;
 //  - each block first copies its A and B matrices into shared memory with coalesced loads
-//    (consecutive threads read consecutive addresses), then every thread reads the n values it
+//    (consecutive threads read consecutive addresses), then every thread reads the values it
 //    needs from shared memory instead of global memory (each element is reused n times).
 // Shared memory per block: 2 * n * n * (matrices per block) floats.
 #ifndef GEMM_THREADS
-#define GEMM_THREADS 256   // target number of threads per block
+#define GEMM_THREADS 128   // target number of threads per block
 #endif
 
 #define CUDA_CHECK(call)                                                          \
@@ -48,6 +50,10 @@
         }                                                                         \
     } while (0)
 
+#ifndef GEMM_R
+#define GEMM_R 4           // rows of C computed by one thread (register blocking)
+#endif
+
 __global__ void batch_gemm_kernel(int n, int batch_size,
                                     const float* A,
                                     const float* B,
@@ -56,28 +62,43 @@ __global__ void batch_gemm_kernel(int n, int batch_size,
     extern __shared__ float smem[];
 
     const int nn  = n * n;
-    const int row = threadIdx.x;
+    const int tpm = blockDim.x * blockDim.y;                     // threads per matrix
+    const int lin = threadIdx.y * blockDim.x + threadIdx.x;      // thread index inside its matrix
     const int col = threadIdx.y;
-    const int t   = col * n + row;                        // linear index inside one matrix
-    const int b   = blockIdx.x * blockDim.z + threadIdx.z; // matrix index in the batch
+    const int b   = blockIdx.x * blockDim.z + threadIdx.z;       // matrix index in the batch
 
-    float* sA = smem + (size_t)threadIdx.z * 2 * nn;       // this matrix's A in shared memory
-    float* sB = sA + nn;                                   // this matrix's B in shared memory
+    float* sA = smem + (size_t)threadIdx.z * 2 * nn;
+    float* sB = sA + nn;
 
-    // coalesced copy of A[b] and B[b] into shared memory (one element per thread)
     if (b < batch_size) {
         const size_t base = (size_t)b * nn;
-        sA[t] = A[base + t];
-        sB[t] = B[base + t];
+        for (int e = lin; e < nn; e += tpm) {                    // coalesced copy into shared memory
+            sA[e] = A[base + e];
+            sB[e] = B[base + e];
+        }
     }
-    __syncthreads();                                       // every thread of the block reaches it
+    __syncthreads();
 
     if (b < batch_size) {
-        float sum = 0.0f;
-        for (int k = 0; k < n; ++k) {
-            sum += sA[k * n + row] * sB[col * n + k];      // A(row,k) * B(k,col), column-major
+        float acc[GEMM_R];
+        int   rows[GEMM_R];
+        #pragma unroll
+        for (int q = 0; q < GEMM_R; ++q) {
+            acc[q]  = 0.0f;
+            rows[q] = min(threadIdx.x + q * blockDim.x, n - 1);  // clamp: rows beyond n are computed but never stored
         }
-        C[(size_t)b * nn + t] = sum;                       // coalesced store
+        for (int k = 0; k < n; ++k) {
+            const float bk = sB[col * n + k];                    // B(k,col): one load reused GEMM_R times
+            #pragma unroll
+            for (int q = 0; q < GEMM_R; ++q) {
+                acc[q] += sA[k * n + rows[q]] * bk;              // A(row,k)
+            }
+        }
+        #pragma unroll
+        for (int q = 0; q < GEMM_R; ++q) {
+            const int row = threadIdx.x + q * blockDim.x;
+            if (row < n) C[(size_t)b * nn + col * n + row] = acc[q];
+        }
     }
 }
 
@@ -245,10 +266,11 @@ int main(int argc, char** argv)
     // --------------------------------------------------------
     // Custom kernel configuration
     // --------------------------------------------------------
-    // one thread per element of C, and as many matrices per block as fit in GEMM_THREADS threads
-    // (blockDim.z is limited to 64 by the hardware, which matters for n <= 2)
-    const int mats_per_block = std::max(1, std::min({GEMM_THREADS / (n * n), 64, batch_size}));
-    dim3 block(n, n, mats_per_block);
+    // GEMM_R rows of one column per thread, and as many matrices per block as fit in GEMM_THREADS threads
+    // (blockDim.z is limited to 64 by the hardware, which matters for tiny n)
+    const int rows_threads   = (n + GEMM_R - 1) / GEMM_R;          // threads along the rows
+    const int mats_per_block = std::max(1, std::min({GEMM_THREADS / (rows_threads * n), 64, batch_size}));
+    dim3 block(rows_threads, n, mats_per_block);
     dim3 grid((batch_size + mats_per_block - 1) / mats_per_block, 1, 1);
     const size_t shmem_bytes = (size_t)2 * n * n * mats_per_block * sizeof(float);
 
