@@ -12,9 +12,36 @@
 // Custom rank-1 update kernel
 // A <- A + alpha * x * y^T
 // Column-major storage: A(i,j) = A[j*m + i]
+//
+// Parallelization: one thread per row i, and each thread updates GER_NJ consecutive columns j.
+//  - threadIdx.x runs along the rows, so the threads of a warp touch consecutive addresses of
+//    the same column (column-major): every load and store of A is coalesced.
+//  - alpha * x[i] is computed once per thread and reused for its GER_NJ columns.
+//  - y[j] is the same for all threads of a warp (a broadcast read).
+//  - gridDim.y is limited to 65535, so when n needs more column blocks than that, each thread
+//    also strides over the columns (j0 += gridDim.y * GER_NJ).
+// The kernel is memory bound: each element of A is read once and written once.
+#ifndef GER_TX
+#define GER_TX 128   // threads per block (rows handled by one block)
+#endif
+#ifndef GER_NJ
+#define GER_NJ 2     // columns handled by one thread
+#endif
+
 __global__ void ger_kernel(int m, int n, float alpha, const float* x, const float* y, float* A)
 {
-    // TODO: write your CUDA kernel here
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;    // row of A
+
+    if (i >= m) return;                                       // last block may be partial
+
+    const float ax = alpha * x[i];
+
+    for (int j0 = blockIdx.y * GER_NJ; j0 < n; j0 += gridDim.y * GER_NJ) {
+        const int jend = min(j0 + GER_NJ, n);                 // last column block may be partial
+        for (int j = j0; j < jend; ++j) {
+            A[(size_t)j * m + i] += ax * y[j];
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -107,8 +134,10 @@ int main(int argc, char** argv)
 
     // n1000: configure your kernel here
     // TODO: the configuration below is a default that you must change
-    dim3 block(16, 16, 1);
-    dim3 grid( 1, 1, 1);
+    dim3 block(GER_TX, 1, 1);
+    dim3 grid((m + GER_TX - 1) / GER_TX,      // blocks along the rows
+              std::min((n + GER_NJ - 1) / GER_NJ, 65535),   // blocks along the columns (GER_NJ columns each, at most 65535)
+              1);
     // end of TODO: kernel configuration
 
     cudaEvent_t start, stop;
